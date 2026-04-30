@@ -63,11 +63,11 @@ _INDUSTRY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # Buckets canónicos para `fuente_lead`. Mismas reglas; texto sin acentos.
 _LEAD_SOURCE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("conferencia/evento", re.compile(r"conferenc|evento|networking|seminario|congreso|charla|expo|feria")),
-    ("recomendación", re.compile(r"colega|recomend|mencion|compañer|amigo|conocido|colaborador|cliente\s+actual")),
+    ("recomendación", re.compile(r"colega|recomend|mencion|companer|amigo|conocido|colaborador|cliente\s+actual")),
     ("foro/comunidad", re.compile(r"\bforo\b|comunidad|grupo\s+de")),
     ("redes sociales", re.compile(r"linkedin|podcast|instagram|facebook|twitter|publicacion|articulo|blog|youtube|tiktok")),
     ("búsqueda online", re.compile(r"google|busqu|\bsearch\b|buscando|internet")),
-    ("publicidad", re.compile(r"\bads?\b|publicidad|anuncio|campaña")),
+    ("publicidad", re.compile(r"\bads?\b|publicidad|anuncio|campana")),
 ]
 
 
