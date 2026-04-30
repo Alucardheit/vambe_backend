@@ -72,20 +72,37 @@ OUTPUT_FIELDS_BY_LANG: dict[Language, tuple[str, ...]] = {
 
 SYSTEM_PROMPTS: dict[Language, str] = {
     "es": (
-        "Eres un analista comercial senior de Vambe, una empresa que ofrece automatización "
-        "de interacciones con clientes (chatbots, IA conversacional). Recibirás la transcripción "
-        "de una reunión de ventas con un lead y un indicador de si la venta se cerró (closed=1) "
-        "o no (closed=0). Tu tarea es producir un análisis ESPECÍFICO y ACCIONABLE en español, "
-        "ajustado al schema entregado. Sé concreto: cita números, integraciones, sectores y "
-        "objeciones explícitas cuando aparezcan. Evita generalidades vacías."
+        "Eres un analista comercial senior de Vambe (empresa de automatización de "
+        "interacciones con clientes: chatbots, IA conversacional). Recibirás la transcripción "
+        "de una reunión de ventas con un lead y un flag closed (1=cerró, 0=no cerró). Produce "
+        "un análisis ESPECÍFICO y ACCIONABLE en español. CITA TEXTUAL del transcript cuando "
+        "puedas — números, sectores, integraciones, frases reales del lead. Prohibido usar "
+        "palabras genéricas o categorías abstractas como respuesta.\n\n"
+        "Qué va en cada campo:\n"
+        "- 'puntos_positivos': señales concretas de que ESTE lead va a comprar — extraídas "
+        "del transcript. Ej: 'menciona presupuesto de 5M para Q2', 'urgencia por lanzamiento "
+        "en marzo'. NO escribas categorías abstractas; usa las frases del cliente.\n"
+        "- 'puntos_negativos': los DOLORES del cliente — qué problema concreto vive HOY que "
+        "lo trajo a Vambe. Ej: '500 consultas diarias respondidas a mano', 'pierde leads "
+        "fuera de horario'. NO son críticas a Vambe.\n"
+        "- 'objeciones_principales': trabas EXPLÍCITAS que el lead mencionó contra contratar. "
+        "Si el lead no expresó objeción, escribe 'ninguna'. NO inventes objeciones."
     ),
     "en": (
-        "You are a senior sales analyst at Vambe, a company that provides customer interaction "
-        "automation (chatbots, conversational AI). You will receive the transcript of a sales "
-        "meeting with a lead and a flag indicating whether the deal closed (closed=1) or not "
-        "(closed=0). Your task is to produce a SPECIFIC and ACTIONABLE analysis in English, "
-        "matching the provided schema. Be concrete: quote numbers, integrations, sectors and "
-        "explicit objections when they appear. Avoid empty generalities."
+        "You are a senior sales analyst at Vambe (customer interaction automation company: "
+        "chatbots, conversational AI). You will receive a sales meeting transcript with a "
+        "lead and a closed flag (1=won, 0=lost). Produce a SPECIFIC and ACTIONABLE analysis "
+        "in English. QUOTE the transcript when possible — numbers, sectors, integrations, "
+        "real lead phrases. Forbidden to answer with generic words or abstract category names.\n\n"
+        "What goes in each field:\n"
+        "- 'positive_points': concrete signals THIS lead will buy — pulled from the transcript. "
+        "Ex: 'mentioned 5M budget for Q2', 'urgency for March launch'. NEVER abstract "
+        "categories; use the client's own phrases.\n"
+        "- 'negative_points': client PAIN POINTS — what specific problem they have TODAY that "
+        "led them to Vambe. Ex: '500 daily inquiries handled manually', 'losing after-hours "
+        "leads'. NOT criticisms of Vambe.\n"
+        "- 'main_objections': EXPLICIT blockers the lead voiced against hiring. If the lead "
+        "raised no objection, write 'none'. NEVER invent objections."
     ),
 }
 
@@ -96,18 +113,24 @@ def _build_prompt(language: Language, nombre: str, vendedor: str, closed: str, t
         estado = "SE CERRÓ la venta" if str(closed).strip() == "1" else "NO se cerró la venta"
         return (
             f"Cliente: {nombre}\nVendedor asignado: {vendedor}\nResultado: {estado}\n\n"
-            f"Transcripción de la reunión:\n\"\"\"\n{transcripcion}\n\"\"\"\n\n"
-            "Genera el análisis usando el schema. Si un campo no se menciona, indícalo "
-            "explícitamente ('no especificado'). En 'puntos_positivos' y 'puntos_negativos' "
-            "lista al menos 2-3 elementos concretos cuando sea posible."
+            f"Transcripción:\n\"\"\"\n{transcripcion}\n\"\"\"\n\n"
+            "Genera el análisis basándote SOLO en el transcript. Si un campo no se menciona, "
+            "responde 'no especificado'. Para 'nivel_interes' usa exactamente: alto/medio/bajo. "
+            "Para 'probabilidad_cierre' usa exactamente: alta/media/baja seguido de una "
+            "justificación corta. En 'puntos_positivos', 'puntos_negativos' y "
+            "'objeciones_principales' incluye 2-3 items separados por '; ' tomados "
+            "TEXTUALMENTE del transcript (no inventes, no uses palabras de las instrucciones)."
         )
     estado = "deal CLOSED" if str(closed).strip() == "1" else "deal NOT closed"
     return (
         f"Client: {nombre}\nAssigned salesperson: {vendedor}\nOutcome: {estado}\n\n"
-        f"Meeting transcript:\n\"\"\"\n{transcripcion}\n\"\"\"\n\n"
-        "Generate the analysis using the schema. If a field is not mentioned, state it "
-        "explicitly ('not specified'). In 'positive_points' and 'negative_points' list at "
-        "least 2-3 concrete items when possible."
+        f"Transcript:\n\"\"\"\n{transcripcion}\n\"\"\"\n\n"
+        "Generate the analysis based ONLY on the transcript. If a field is not mentioned, "
+        "answer 'not specified'. For 'interest_level' use exactly: high/medium/low. "
+        "For 'closing_probability' use exactly: high/medium/low followed by a short "
+        "justification. In 'positive_points', 'negative_points' and 'main_objections' "
+        "include 2-3 items separated by '; ' taken VERBATIM from the transcript (do not "
+        "invent, do not use words from the instructions)."
     )
 
 

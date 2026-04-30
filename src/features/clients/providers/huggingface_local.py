@@ -37,6 +37,13 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+# Tokens reservados para la respuesta JSON. El resto del contexto es para el input.
+_MAX_NEW_TOKENS = 3072
+# Contexto máximo del modelo. SmolLM2-1.7B soporta hasta 8192.
+_MODEL_MAX_CONTEXT = 8192
+# Tokens disponibles para el input (contexto - output reservado - margen de seguridad).
+_MAX_INPUT_TOKENS = _MODEL_MAX_CONTEXT - _MAX_NEW_TOKENS - 64
+
 
 def _detect_device() -> str:
     """
@@ -73,7 +80,6 @@ def _select_dtype(device: str) -> Any:
     if device == "cpu":
         return torch.float32
     if device == "mps":
-        # MPS no soporta bien bf16; usar fp16.
         return torch.float16
     return torch.float16
 
@@ -98,21 +104,32 @@ def _load_hf_model(model_id: str, token: str | None) -> tuple[Any, Any, str]:
     tokenizer = AutoTokenizer.from_pretrained(model_id, **auth)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
+        dtype=dtype,
+        device_map=device,
         **auth,
-    ).to(device)
+    )
     model.eval()
-    logger.info("Modelo HF '%s' listo.", model_id)
+    logger.info("Modelo HF '%s' listo en %s.", model_id, device)
     return tokenizer, model, device
 
 
 def _extract_first_json(text: str) -> str | None:
-    """Extrae el primer objeto JSON balanceado `{...}` del texto."""
-    # Quita fences markdown comunes: ```json ... ``` o ``` ... ```
-    fence = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
-    if fence:
-        text = fence.group(1)
+    """
+    Extrae el primer objeto JSON balanceado `{...}` del texto.
+
+    Maneja dos casos:
+    - Fence completo: ```json ... ```
+    - Fence sin cierre (output truncado): ```json ... <EOF>
+    """
+    # Intenta fence completo primero.
+    fence_closed = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL | re.IGNORECASE)
+    if fence_closed:
+        text = fence_closed.group(1)
+    else:
+        # Si hay apertura de fence sin cierre, descarta solo el marcador inicial.
+        fence_open = re.match(r"```(?:json)?\s*\n?", text, re.IGNORECASE)
+        if fence_open:
+            text = text[fence_open.end():]
 
     depth = 0
     start = -1
@@ -144,13 +161,13 @@ def _extract_first_json(text: str) -> str | None:
 
 class HuggingFaceLocalProvider(LLMProvider):
     name = "huggingface"
-    # GPU/CPU es single-threaded para inferencia: serializar requests evita OOM.
+    # El lock interno ya serializa la GPU — no necesitamos semáforo adicional.
     recommended_concurrency = 1
 
     def __init__(self, model_id: str, token: str | None = None) -> None:
         self.model_id = model_id
         self.token = token or None
-        # Lock async para serializar generaciones (tokenizer/model no son thread-safe en GPU).
+        # Lock para serializar generaciones: tokenizer/model no son thread-safe.
         self._lock = asyncio.Lock()
 
     async def generate_structured(
@@ -169,16 +186,16 @@ class HuggingFaceLocalProvider(LLMProvider):
 
         tokenizer, model, device = _load_hf_model(self.model_id, self.token)
 
-        # Schema compacto: solo nombres + tipos, sin descripciones (ahorra ~40% tokens).
-        compact_fields = {
-            name: field.annotation.__name__ if hasattr(field.annotation, "__name__") else "str"
-            for name, field in schema.model_fields.items()
-        }
+        # Lista de nombres de campos, sin tipos (evita que el modelo eche "str" como valor).
+        field_names = list(schema.model_fields.keys())
         user_with_schema = (
             f"{user}\n\n"
-            f"Respond with a single JSON object containing exactly these string fields: "
-            f"{json.dumps(compact_fields, ensure_ascii=False)}. "
-            f"No markdown fences, no commentary, no text outside the JSON."
+            f"Respond with a single JSON object with EXACTLY these keys (in this order): "
+            f"{', '.join(field_names)}. "
+            f"Each value must be a string with the actual analysis CONTENT — never the field "
+            f"name, never 'str', never the example words from the instructions. "
+            f"Rules: output ONLY the raw JSON object, no markdown fences, no extra text. "
+            f"Keep each field value under 25 words. Start your response with {{."
         )
 
         messages = [
@@ -186,10 +203,6 @@ class HuggingFaceLocalProvider(LLMProvider):
             {"role": "user", "content": user_with_schema},
         ]
 
-        # Llama-style chat template (SmolLM2-Instruct lo trae).
-        # transformers v5: apply_chat_template devuelve BatchEncoding cuando
-        # return_dict=True; pasamos **inputs a generate() para incluir
-        # attention_mask y evitar el AttributeError sobre .shape.
         chat_template = getattr(tokenizer, "chat_template", None)
         if chat_template:
             inputs = tokenizer.apply_chat_template(
@@ -202,22 +215,37 @@ class HuggingFaceLocalProvider(LLMProvider):
             text = "\n\n".join(f"[{m['role'].upper()}]\n{m['content']}" for m in messages)
             inputs = tokenizer(text, return_tensors="pt")
 
-        inputs = {k: v.to(device) for k, v in inputs.items()}
         input_length = inputs["input_ids"].shape[1]
 
-        # Greedy decoding (do_sample=False) es ~2x más rápido que sampling y
-        # más determinístico para JSON. max_new_tokens=768 cubre los ~500-700
-        # tokens que ocupan los 12 campos del schema.
+        # Truncar si el input supera el límite: recorta desde el centro del mensaje
+        # de usuario (donde está la transcripción), preservando sistema y esquema.
+        if input_length > _MAX_INPUT_TOKENS:
+            logger.warning(
+                "Input demasiado largo (%d tokens), truncando a %d tokens.",
+                input_length,
+                _MAX_INPUT_TOKENS,
+            )
+            for key in inputs:
+                inputs[key] = inputs[key][:, :_MAX_INPUT_TOKENS]
+            input_length = _MAX_INPUT_TOKENS
+
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=768,
+                max_new_tokens=_MAX_NEW_TOKENS,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
 
         new_tokens = outputs[0, input_length:]
+        n_new = len(new_tokens)
+        if n_new >= _MAX_NEW_TOKENS - 10:
+            logger.warning("Output cerca del límite (%d/%d tokens). JSON puede estar truncado.", n_new, _MAX_NEW_TOKENS)
+        else:
+            logger.debug("Generados %d tokens nuevos.", n_new)
         text = tokenizer.decode(new_tokens, skip_special_tokens=True)
 
         json_str = _extract_first_json(text)

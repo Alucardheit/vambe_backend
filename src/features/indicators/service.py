@@ -1,3 +1,5 @@
+import re
+import unicodedata
 from collections import Counter, defaultdict
 from typing import Iterable
 
@@ -11,6 +13,85 @@ from .schemas import (
 )
 
 ERROR_MARKER: str = "error"
+
+# Separadores típicos en los textos del LLM (ES + EN): comas, punto y coma,
+# saltos, conectores ' y ' / ' and ', viñetas y guiones al inicio.
+_ITEM_SPLIT_RE = re.compile(r"[,;\n]| y | and |^\s*[-*•·]\s*", re.IGNORECASE | re.MULTILINE)
+
+# Items vacíos/triviales descartados tras el split.
+_TRIVIAL_ITEMS = {
+    "", "no especificado", "not specified", "n/a", "na",
+    "ninguno", "ninguna", "none", "str", "string", "null",
+}
+
+# Filtra valores que parecen tipos/placeholders del schema o contadores numéricos sueltos.
+_NUMERIC_ONLY = re.compile(r"^[\d.,%]+$")
+_MIN_ITEM_LEN = 5  # 'str', 'n/a', etc. quedan fuera; frases reales pasan.
+
+# Mapeos de normalización para campos categóricos con vocabulario fijo.
+# Cubre ES, EN y errores comunes del LLM.
+_INTEREST_BUCKETS: dict[str, str] = {
+    "alto": "alto", "alta": "alto", "high": "alto",
+    "medio": "medio", "media": "medio", "medium": "medio", "mid": "medio",
+    "bajo": "bajo", "baja": "bajo", "low": "bajo",
+}
+_PROBABILITY_BUCKETS: dict[str, str] = _INTEREST_BUCKETS  # mismo vocabulario alta/media/baja
+
+# Buckets canónicos para `industria`. El primer pattern que matchee gana, así que
+# patterns más específicos deben ir antes que los genéricos. Los patterns operan
+# sobre texto SIN acentos (ver `_classify` → `_strip_accents`).
+_INDUSTRY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("salud", re.compile(r"salud|clinic|medic|paciente|hospital|farmac")),
+    ("moda", re.compile(r"\bmoda\b|ropa|prenda|textil|vestir|fashion")),
+    ("gastronomía", re.compile(r"restaurant|catering|gastronom|comida|alimento|\bbar\b|panader")),
+    ("turismo/hospitalidad", re.compile(r"turismo|hotel|hospedaje|viaje|tour")),
+    ("educación", re.compile(r"educac|colegio|universidad|curso|escuela|academ")),
+    ("inmobiliaria", re.compile(r"inmobil|propiedad|arriend|real\s*estate|bienes\s*raices")),
+    ("agricultura", re.compile(r"agric|cultivo|cosecha|granja|agro")),
+    ("logística", re.compile(r"logist|envio|transport|delivery|courier")),
+    ("manufactura", re.compile(r"fabrica|produccion|manufactur|industrial")),
+    ("automotriz", re.compile(r"automov|vehicul|taller|mecanic")),
+    ("construcción", re.compile(r"construc|obra|edific|arquitect")),
+    ("seguridad", re.compile(r"seguridad|vigilanc|alarma")),
+    ("deportes/fitness", re.compile(r"deport|gimnasio|fitness|atlet")),
+    ("finanzas", re.compile(r"financ|banco|inversion|seguros|credit")),
+    ("consultoría", re.compile(r"consultor|asesor")),
+    ("tecnología/software", re.compile(r"software|tech|tecnolog|startup|saas|\bapp\b|\bit\b|digital")),
+    ("comercio/retail", re.compile(r"tienda|comercio|e-?commerce|retail|venta")),
+]
+
+# Buckets canónicos para `fuente_lead`. Mismas reglas; texto sin acentos.
+_LEAD_SOURCE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("conferencia/evento", re.compile(r"conferenc|evento|networking|seminario|congreso|charla|expo|feria")),
+    ("recomendación", re.compile(r"colega|recomend|mencion|companer|amigo|conocido|colaborador|cliente\s+actual")),
+    ("foro/comunidad", re.compile(r"\bforo\b|comunidad|grupo\s+de")),
+    ("redes sociales", re.compile(r"linkedin|podcast|instagram|facebook|twitter|publicacion|articulo|blog|youtube|tiktok")),
+    ("búsqueda online", re.compile(r"google|busqu|\bsearch\b|buscando|internet")),
+    ("publicidad", re.compile(r"\bads?\b|publicidad|anuncio|campana")),
+]
+
+
+def _strip_accents(text: str) -> str:
+    """Remueve acentos para que regex `busqu` matchee 'búsqueda', 'tecnologia'≈'tecnología', etc."""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    )
+
+
+def _classify(value: str, patterns: list[tuple[str, re.Pattern[str]]]) -> str:
+    """
+    Mapea un string libre del LLM a un bucket canónico vía keyword matching.
+    Normaliza acentos antes de matchear ('búsqueda' → 'busqueda').
+    Devuelve 'no especificado' si está vacío, 'otro' si ningún pattern matchea.
+    """
+    raw = (value or "").strip().lower()
+    if not raw or raw in _TRIVIAL_ITEMS:
+        return "no especificado"
+    text = _strip_accents(raw)
+    for label, pattern in patterns:
+        if pattern.search(text):
+            return label
+    return "otro"
 
 EN_TO_ES_KEYS: dict[str, str] = {
     "name": "nombre",
@@ -113,10 +194,70 @@ def _industria_area_chart(rows: list[dict[str, str]]) -> StackedAreaChart:
     )
 
 
-def _first_word(text: str) -> str:
-    """Primera palabra (lowercased) — 'Alta - tiene presupuesto' → 'alta'."""
+def _bucketize(text: str, buckets: dict[str, str], fallback: str = "no especificado") -> str:
+    """
+    Normaliza un valor categórico al bucket canónico buscando la primera palabra
+    de `text` en el diccionario. 'Alta - tiene presupuesto' → 'alto'.
+    Valores que no caen en ningún bucket (basura, números sueltos) → `fallback`.
+    """
     cleaned = text.strip().lower()
-    return cleaned.split()[0].rstrip(".,;:") if cleaned else "no especificado"
+    if not cleaned:
+        return fallback
+    first = cleaned.split()[0].rstrip(".,;:()")
+    return buckets.get(first, fallback)
+
+
+def _split_items(text: str) -> list[str]:
+    """
+    Divide un texto libre en items normalizados y descarta basura común del LLM:
+    placeholders ('str'/'string'/'null'), números sueltos ('0.6'), items <5 chars.
+    """
+    if not text:
+        return []
+    parts = _ITEM_SPLIT_RE.split(text)
+    out: list[str] = []
+    for p in parts:
+        item = p.strip().lower().rstrip(".:;,()").lstrip("-*•·() ")
+        if not item or item in _TRIVIAL_ITEMS:
+            continue
+        if len(item) < _MIN_ITEM_LEN:
+            continue
+        if _NUMERIC_ONLY.match(item):
+            continue
+        out.append(item)
+    return out
+
+
+def _aggregate_items(rows: list[dict[str, str]], field: str, top_n: int = 8) -> list[CategoryStat]:
+    """
+    Extrae items del campo de texto libre y devuelve los top_n más frecuentes.
+
+    Filtra eco del schema: items que aparecen en >50% de las filas son casi siempre
+    el LLM repitiendo palabras de las instrucciones, no insights reales.
+    """
+    n_rows = len(rows) or 1
+    row_presence: Counter[str] = Counter()
+    raw_counter: Counter[str] = Counter()
+    for row in rows:
+        items = _split_items(row.get(field, ""))
+        for item in items:
+            raw_counter[item] += 1
+        for item in set(items):
+            row_presence[item] += 1
+
+    too_common_threshold = n_rows * 0.5
+    filtered = [
+        (item, count)
+        for item, count in raw_counter.items()
+        if row_presence[item] <= too_common_threshold
+    ]
+    filtered.sort(key=lambda kv: kv[1], reverse=True)
+
+    total = sum(c for _, c in filtered) or 1
+    return [
+        CategoryStat(label=label, count=count, percentage=_percentage(count, total))
+        for label, count in filtered[:top_n]
+    ]
 
 
 def compute_indicators(rows: list[dict[str, str]]) -> IndicatorsResponse:
@@ -142,18 +283,38 @@ def compute_indicators(rows: list[dict[str, str]]) -> IndicatorsResponse:
         not_closed_percentage=_percentage(total - closed_count, total),
     )
 
+    # Filas enriquecidas con la industria/fuente clasificadas a buckets canónicos.
+    # Se usan para todas las agregaciones, pero `analyzed_rows` mantiene el texto
+    # original del LLM para que el drawer muestre el detalle textual.
+    enriched = [
+        {
+            **r,
+            "industria": _classify(r.get("industria", ""), _INDUSTRY_PATTERNS),
+            "fuente_lead": _classify(r.get("fuente_lead", ""), _LEAD_SOURCE_PATTERNS),
+        }
+        for r in valid
+    ]
+
     return IndicatorsResponse(
         total_clients=total,
         analysis_errors=errors,
         closed_rate=closed_rate,
-        by_industria=_category_stats((r.get("industria", "") for r in valid), total),
-        by_nivel_interes=_category_stats((r.get("nivel_interes", "") for r in valid), total),
-        by_probabilidad_cierre=_category_stats(
-            (_first_word(r.get("probabilidad_cierre", "")) for r in valid), total
+        by_industria=_category_stats((r["industria"] for r in enriched), total),
+        by_nivel_interes=_category_stats(
+            (_bucketize(r.get("nivel_interes", ""), _INTEREST_BUCKETS) for r in enriched), total
         ),
-        by_fuente_lead=_category_stats((r.get("fuente_lead", "") for r in valid), total),
-        by_vendedor=_category_stats((r.get("vendedor_asignado", "") for r in valid), total),
-        closed_rate_by_industria=_closed_rate_by_category(valid, "industria"),
-        closed_rate_by_vendedor=_closed_rate_by_category(valid, "vendedor_asignado"),
-        industria_area_chart=_industria_area_chart(valid),
+        by_probabilidad_cierre=_category_stats(
+            (_bucketize(r.get("probabilidad_cierre", ""), _PROBABILITY_BUCKETS) for r in enriched),
+            total,
+        ),
+        by_fuente_lead=_category_stats((r["fuente_lead"] for r in enriched), total),
+        by_vendedor=_category_stats((r.get("vendedor_asignado", "") for r in enriched), total),
+        closed_rate_by_industria=_closed_rate_by_category(enriched, "industria"),
+        closed_rate_by_vendedor=_closed_rate_by_category(enriched, "vendedor_asignado"),
+        industria_area_chart=_industria_area_chart(enriched),
+        top_puntos_positivos=_aggregate_items(valid, "puntos_positivos"),
+        top_puntos_negativos=_aggregate_items(valid, "puntos_negativos"),
+        top_objeciones=_aggregate_items(valid, "objeciones_principales"),
+        top_proximos_pasos=_aggregate_items(valid, "proximos_pasos_sugeridos"),
+        analyzed_rows=valid,
     )
