@@ -62,3 +62,23 @@ class IndicatorsResponse(BaseModel):
     industria_area_chart: StackedAreaChart = Field(
         description="Datos para gráfico de área apilado: closed vs not_closed por industria."
     )
+    top_puntos_positivos: list[CategoryStat] = Field(
+        default_factory=list,
+        description="Items más mencionados extraídos del campo puntos_positivos.",
+    )
+    top_puntos_negativos: list[CategoryStat] = Field(
+        default_factory=list,
+        description="Items más mencionados extraídos del campo puntos_negativos.",
+    )
+    top_objeciones: list[CategoryStat] = Field(
+        default_factory=list,
+        description="Objeciones más frecuentes extraídas del campo objeciones_principales.",
+    )
+    top_proximos_pasos: list[CategoryStat] = Field(
+        default_factory=list,
+        description="Próximos pasos sugeridos más mencionados.",
+    )
+    analyzed_rows: list[dict] = Field(
+        default_factory=list,
+        description="Filas analizadas completas para drill-down por cliente.",
+    )
